@@ -1,59 +1,130 @@
-import re
-from duckduckgo_search import ddg
-from jaro import jaro_winkler_metric as distance
+"""Find likely web sources for sentences in a text file."""
+
 import multiprocessing
+import re
+from pathlib import Path
 
-# Define a regular expression pattern to match sentences
-sentence_pattern = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s')
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException
+from jaro import jaro_winkler_metric as distance
 
-# Define a regular expression pattern to exclude sentences containing digits
-not_in_sentence = re.compile(r'\[\d*\]|\d+')
+# Split on sentence-ending punctuation while keeping common abbreviations intact.
+SENTENCE_PATTERN = re.compile(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s")
 
-sentences = []
+# Drop sentences that contain citation markers or other digits.
+NOT_IN_SENTENCE = re.compile(r"\[\d*\]|\d+")
 
-# Open the input file
-with open('./text-to-cite.txt', 'r') as f:
-    # Read the file contents
-    text = f.read()
+MATCH_THRESHOLD = 0.65
+MAX_RESULTS = 100
+# ddgs fetches one result page per call. Cap follow-up pages so a query
+# still considers up to MAX_RESULTS hits without looping forever.
+MAX_PAGES = 10
+DEFAULT_INPUT = Path("./text-to-cite.txt")
 
-    # Split the text into sentences using the pattern
-    s = sentence_pattern.split(text)
 
-    # Extract the sentences that don't contain digits
-    for sentence in s:
-        if len(not_in_sentence.findall(sentence.strip())) == 0:
+def extract_sentences(text):
+    sentences = []
+    for sentence in SENTENCE_PATTERN.split(text):
+        if len(NOT_IN_SENTENCE.findall(sentence.strip())) == 0:
             sentences.append(sentence.strip())
+    return sentences
 
-sentences_urls = []
+
+def load_sentences(path=DEFAULT_INPUT):
+    with open(path) as handle:
+        text = handle.read()
+    return extract_sentences(text)
 
 
-def process_sentence(sentence):
-    # Use DuckDuckGo to search for the sentence
-    r = ddg('inurl:' + sentence, max_results=100)
-    if not r:
-        return {'sentence': sentence, 'url': 'original_sentence'}
-    # Find the link with the highest Jaro distance score
+def select_citation(sentence, results):
+    if not results:
+        return {"sentence": sentence, "url": "original_sentence"}
+
     max_score = 0.0
     max_link = None
-    for link in r:
-        score = distance(link['body'], sentence)
+    for link in results:
+        score = distance(link["body"], sentence)
         if score > max_score:
             max_score = score
             max_link = link
 
-    # If a link was found, add it to the list of sentence URLs
-    if max_link and max_score >= 0.65:
-        return {'sentence': sentence, 'url': max_link['href'], 'title': max_link['title']}
-    else:
-        return {'sentence': sentence, 'url': 'original_sentence'}
+    if max_link and max_score >= MATCH_THRESHOLD:
+        return {
+            "sentence": sentence,
+            "url": max_link["href"],
+            "title": max_link["title"],
+        }
+    return {"sentence": sentence, "url": "original_sentence"}
 
 
-if __name__ == '__main__':
-    multiprocessing.freeze_support()
-    # Use multiprocessing to search the internet for each sentence
+def _is_empty_search(exc):
+    # duckduckgo_search.ddg() returned a false value when a query had no hits.
+    # ddgs raises DDGSException("No results found.") for that case.
+    return "No results found" in str(exc)
+
+
+def _collect_pages(client, query, backend, region):
+    collected = []
+    seen = set()
+    for page in range(1, MAX_PAGES + 1):
+        try:
+            batch = client.text(
+                query,
+                region=region,
+                max_results=MAX_RESULTS,
+                page=page,
+                backend=backend,
+            )
+        except DDGSException as exc:
+            if _is_empty_search(exc) or collected:
+                break
+            raise
+        if not batch:
+            break
+
+        new_count = 0
+        for item in batch:
+            href = item.get("href")
+            if href in seen:
+                continue
+            seen.add(href)
+            collected.append(item)
+            new_count += 1
+            if len(collected) >= MAX_RESULTS:
+                return collected
+        if new_count == 0:
+            break
+    return collected
+
+
+def search_results(sentence):
+    """Search for pages that match a sentence.
+
+    The original script queried DuckDuckGo with an ``inurl:`` operator.
+    That endpoint currently answers HTTP 202 without result HTML, and other
+    engines in ddgs do not treat ``inurl:`` as a search operator. When the
+    DuckDuckGo query has no hits, fall back to a plain-text metasearch.
+    """
+    client = DDGS()
+    collected = _collect_pages(client, "inurl:" + sentence, "duckduckgo", "wt-wt")
+    if collected:
+        return collected
+    return _collect_pages(client, sentence, "auto", "us-en") or None
+
+
+def process_sentence(sentence):
+    return select_citation(sentence, search_results(sentence))
+
+
+def main(path=DEFAULT_INPUT):
+    sentences = load_sentences(path)
     with multiprocessing.Pool(processes=4) as pool:
         sentences_urls = pool.map(process_sentence, sentences)
 
-    # Print out the sentence URLs
     for sentence_url in sentences_urls:
         print(f"{sentence_url['sentence']}: {sentence_url['url']}")
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
